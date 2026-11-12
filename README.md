@@ -39,8 +39,10 @@ master password, and never contacts the network. There are no accounts to
 create, no subscriptions, and no cloud — just you and a file.
 
 It is a **substantial fork** of [**BNDGG-Vault**](https://github.com/Krahzin/BNDGG-Vault)
-by [Krahzin](https://github.com/Krahzin), rewritten with a new interface, a
-new vault format, and additional features. See [*Why a fork?*](#why-a-fork).
+by [Krahzin](https://github.com/Krahzin). While the original was built with 
+`customtkinter`, Kestrel Vault is a complete rewrite featuring a modern **PySide6** 
+interface, a new vault format, and a significantly expanded feature set. 
+See [*Why a fork?*](#why-a-fork).
 
 ---
 
@@ -103,7 +105,7 @@ That's it. You'll be asked to create a master password on first launch.
   - **Old** passwords (not changed in over a year)
 
 ### Interface
-- 12 themes × 10 accent colours, all switchable at runtime.
+- **12 themes × 10 accent colours**, all switchable at runtime.
 - Light, dark, and high-contrast options.
 - Optional **reduce motion** mode for accessibility.
 - Full keyboard navigation — [see shortcuts](#keyboard-shortcuts).
@@ -159,15 +161,15 @@ For vulnerability reports, see [**SECURITY.md**](SECURITY.md).
 
 This started as a personal project to make BNDGG-Vault fit my workflow. The
 core of the codebase was solid, but the interface, file format, and feature
-set were limiting. Rather than maintain a shadow fork privately, I rewrote
-the parts that needed it and published it here.
+set were limiting. Rather than maintain a shadow fork privately, I completely 
+rewrote the UI and underlying architecture, and published it here.
 
 | | BNDGG-Vault | Kestrel Vault |
 | :--- | :---: | :---: |
+| UI framework | `customtkinter` | **PySide6 (complete rewrite)** |
+| Themes | 1 | **12 × 10 accents** |
 | KDF | Argon2id | Argon2id (tuned) |
 | Vault schema | v2 | **v3** (migrates v2 on open) |
-| UI framework | PySide6 | PySide6 (rewritten) |
-| Themes | 1 | **12 × 10 accents** |
 | Passphrase generator | — | **EFF diceware** |
 | Health report | — | **weak / reused / old** |
 | Full `otpauth://` support | partial | **yes** |
