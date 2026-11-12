@@ -11,7 +11,7 @@
   <img alt="PySide6" src="https://img.shields.io/badge/UI-PySide6-22c55e?style=flat-square">
   <img alt="Argon2id" src="https://img.shields.io/badge/KDF-Argon2id-a855f7?style=flat-square">
   <img alt="Fernet" src="https://img.shields.io/badge/cipher-Fernet-f97316?style=flat-square">
-  <a href="https://github.com/<YOUR-USER>/Kestrel-Vault/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/<YOUR-USER>/Kestrel-Vault/ci.yml?style=flat-square&label=CI"></a>
+  <a href="https://github.com/ibra-tuna/Kestrel-Vault/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ibra-tuna/Kestrel-Vault/ci.yml?style=flat-square&label=CI"></a>
 </p>
 
 <p align="center">
@@ -43,7 +43,7 @@ new vault format, and additional features. See [*Why a fork?*](#why-a-fork).
 ## Quick start
 
 ```bash
-git clone https://github.com/<YOUR-USER>/Kestrel-Vault.git
+git clone https://github.com/ibra-tuna/Kestrel-Vault.git
 cd Kestrel-Vault
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -55,7 +55,7 @@ That's it. You'll be asked to create a master password on first launch.
 **There is no recovery** — lose the password, lose the vault.
 
 > **Windows users in a hurry:** download `KestrelVault-windows.zip` from
-> [Releases](https://github.com/<YOUR-USER>/Kestrel-Vault/releases), unpack,
+> [Releases](https://github.com/ibra-tuna/Kestrel-Vault/releases), unpack,
 > and double-click `KestrelVault.exe`.
 
 ---
@@ -372,7 +372,7 @@ See [NOTICE](NOTICE) for the original authorship and a list of changes.
 
 - **Original project:** [BNDGG-Vault](https://github.com/Krahzin/BNDGG-Vault)
   by [Krahzin](https://github.com/Krahzin).
-- **Fork maintainer:** `<YOUR NAME>` ([@<YOUR-USER>](https://github.com/<YOUR-USER>)).
+- **Fork maintainer:** Ibrahim Al Assaad ([@ibra-tuna](https://github.com/ibra-tuna)).
 - **Libraries:** [PySide6](https://www.qt.io/qt-for-python) (LGPLv3),
   [cryptography](https://cryptography.io),
   [argon2-cffi](https://github.com/hynek/argon2-cffi),
