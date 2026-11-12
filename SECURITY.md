@@ -4,9 +4,9 @@
 
 **Please do not open a public issue for a security problem.**
 
-- **Maintainer:** `<YOUR NAME>`
-- **Preferred contact:** `<your.email@example.com>`
-  (or DM `@<YOUR-USER>` on GitHub)
+- **Maintainer:** Ibrahim Al Assaad
+- **Preferred contact:** ibrahimassaad1635@gmail.com
+  (or DM [@ibra-tuna](https://github.com/ibra-tuna) on GitHub)
 
 You should get an acknowledgement within **72 hours**, and a fix or a
 mitigation plan within **14 days** for confirmed issues.
