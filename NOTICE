@@ -1,0 +1,29 @@
+Kestrel Vault
+=============
+
+This project is a fork of BNDGG-Vault:
+
+    https://github.com/Krahzin/BNDGG-Vault
+
+Original work Copyright (c) Krahzin
+Licensed under the MIT License (see LICENSE).
+
+Modifications and new code in Kestrel Vault
+Copyright (c) 2026 <YOUR NAME HERE>
+Licensed under the MIT License (see LICENSE).
+
+Kestrel Vault is a substantial rewrite of BNDGG-Vault. Changes include:
+
+  * A redesigned PySide6 interface with 12 themes and 10 accent colours
+  * Vault schema v3, with automatic migration from v2
+    (the original vault is preserved as vault.v2.bak)
+  * Argon2id key derivation (t=3, m=64 MiB, p=4)
+  * Full otpauth:// TOTP support with a live refresh bar
+  * A password health report (weak / reused / old passwords)
+  * CSV importers for Bitwarden, 1Password and browser exports
+  * Encrypted backup export/restore with pre-import snapshots
+  * Configurable auto-lock (idle, on minimize, on blur)
+  * Sensitive clipboard handling with auto-clear and manager hints
+  * Instant Caps Lock warning while typing a master password
+
+See README.md for usage and CHANGES.md for the full change history.
