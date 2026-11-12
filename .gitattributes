@@ -1,0 +1,18 @@
+# Normalise line endings across platforms
+* text=auto eol=lf
+
+# Windows scripts should stay CRLF so they run from Explorer
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary assets
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+
+# Keep spec files as text
+*.spec text
