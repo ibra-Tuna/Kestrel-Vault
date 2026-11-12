@@ -18,7 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        # Only test the oldest and newest supported versions to save CI time.
+        python: ["3.10", "3.13"]
     env:
       # Headless Qt: no X server on the CI runners.
       QT_QPA_PLATFORM: offscreen
