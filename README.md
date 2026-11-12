@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="Kestrel Vault Logo" width="120">
+</p>
+
 <h1 align="center">Kestrel Vault</h1>
 
 <p align="center">
