@@ -1,4 +1,5 @@
-customtkinter
-cryptography
-argon2-cffi
-pyinstaller
+PySide6>=6.6
+cryptography>=42
+argon2-cffi>=23.1
+diceware>=0.10
+zxcvbn>=4.4.28
