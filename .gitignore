@@ -1,0 +1,68 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ---- Virtual environments ----
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# ---- PyInstaller build output ----
+build/
+dist/
+# IMPORTANT: kestrel_vault.spec is TRACKED. Never add *.spec here.
+# IMPORTANT: app.ico is TRACKED. Never add *.ico here.
+
+# ---- Testing ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+coverage.xml
+*.cover
+
+# ---- Packaging ----
+*.egg-info/
+.eggs/
+sdist/
+wheels/
+*.whl
+pip-wheel-metadata/
+
+# ---- IDEs / editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+*.sublime-project
+*.sublime-workspace
+
+# ---- OS ----
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ---- Runtime artefacts produced while testing ----
+*.log
+cache/
+logs/
+vault.json
+vault.json.bak
+vault.v2.bak
+vault.pre-import-*.json
+settings.json
+lockout.json
