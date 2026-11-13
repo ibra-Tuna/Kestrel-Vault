@@ -15,6 +15,7 @@
   <img alt="PySide6" src="https://img.shields.io/badge/UI-PySide6-22c55e?style=flat-square">
   <img alt="Argon2id" src="https://img.shields.io/badge/KDF-Argon2id-a855f7?style=flat-square">
   <img alt="Fernet" src="https://img.shields.io/badge/cipher-Fernet-f97316?style=flat-square">
+  <a href="https://github.com/ibra-tuna/Kestrel-Vault/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/ibra-tuna/Kestrel-Vault?style=flat-square&label=release"></a>
   <a href="https://github.com/ibra-tuna/Kestrel-Vault/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ibra-tuna/Kestrel-Vault/ci.yml?style=flat-square&label=CI"></a>
 </p>
 
@@ -48,6 +49,22 @@ See [*Why a fork?*](#why-a-fork).
 
 ## Quick start
 
+### Option 1 — Prebuilt release (Windows only)
+
+The latest stable build is **v3.0.0**, available from the
+[**Releases**](https://github.com/ibra-tuna/Kestrel-Vault/releases/tag/v3.0.0)
+tab.
+
+> **Only Windows binaries are published.** There is **no** prebuilt Linux or
+> macOS bundle — those platforms must run from source (Option 2) or build
+> their own (see [*Build from source*](#build-from-source)).
+
+- **Windows:** download `KestrelVault-windows.zip`, unpack it, and
+  double-click `KestrelVault.exe`. Single self-contained file — no install,
+  no Python required.
+
+### Option 2 — From source (Windows, Linux, macOS)
+
 ```bash
 git clone https://github.com/ibra-tuna/Kestrel-Vault.git
 cd Kestrel-Vault
@@ -59,10 +76,6 @@ python -m kestrel_vault
 
 That's it. You'll be asked to create a master password on first launch.
 **There is no recovery** — lose the password, lose the vault.
-
-> **Windows users in a hurry:** download `KestrelVault-windows.zip` from
-> [Releases](https://github.com/ibra-tuna/Kestrel-Vault/releases), unpack,
-> and double-click `KestrelVault.exe`.
 
 ---
 
@@ -228,7 +241,20 @@ folder beside it. Copy it anywhere and run it.
 The CI also builds this artifact on every push to `main` and every tag
 matching `v*`. Grab it from **Actions → CI → KestrelVault-windows**.
 
-### From source
+### Linux / macOS
+
+There is no PyInstaller spec for these platforms yet, so they run from
+source:
+
+```bash
+pip install -r requirements.txt
+python -m kestrel_vault
+```
+
+Contributions for a Linux AppImage/Flatpak or a macOS `.app` bundle are
+welcome — see [*Contributing*](#contributing).
+
+### From source (any platform)
 
 ```bash
 pip install -r requirements.txt
@@ -324,9 +350,10 @@ Yes, automatically. See [*Migrating from BNDGG-Vault*](#migrating-from-bndgg-vau
 Not officially. You can set `APPDATA` (Windows) or `XDG_DATA_HOME`
 (Linux/macOS) to a folder on the USB drive before launching.
 
-**Why is the release only on Windows?**
-The PyInstaller spec is Windows-only. Linux and macOS users can run from
-source. Contributions for a macOS `.app` bundle are welcome.
+**Why are the releases Windows-only?**
+The PyInstaller spec is Windows-only. Linux and macOS users run from source
+(see [*Quick start*](#quick-start) → Option 2) or build their own. Pull
+requests adding a Linux or macOS packaging setup are welcome.
 
 </details>
 
