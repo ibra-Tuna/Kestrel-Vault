@@ -252,7 +252,7 @@ python -m kestrel_vault
 ```
 
 Contributions for a Linux AppImage/Flatpak or a macOS `.app` bundle are
-welcome — see [*Contributing*](#contributing).
+welcome — see [**CONTRIBUTING.md**](CONTRIBUTING.md#packaging).
 
 ### From source (any platform)
 
@@ -376,22 +376,17 @@ If you'd rather do it manually: copy `vault.json` from
 
 </details>
 
-<details>
-<summary><b>Contributing</b> (click to expand)</summary>
+---
 
-<br>
+## Contributing
 
-1. Fork, then branch: `git checkout -b feature/my-thing`.
-2. Keep `python -m pytest tests -q` green.
-3. Respect the architecture rule: **no `import PySide6`** in `crypto.py`,
-   `storage.py`, `models.py`, `passwords.py`, or `importers.py`.
-4. Match the existing style.
-5. Open a pull request describing what changed and why.
+Contributions are welcome — bug reports, feature ideas, docs, and code. Please
+read [**CONTRIBUTING.md**](CONTRIBUTING.md) before opening a pull request; it
+covers the dev setup, the architecture rule (no `PySide6` in the core), the test
+requirements, and the PR checklist.
 
 For security issues, **do not open a public issue** — see
 [SECURITY.md](SECURITY.md).
-
-</details>
 
 ---
 
