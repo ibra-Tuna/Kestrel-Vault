@@ -30,6 +30,10 @@ GitHub: *Repository → Security → Advisories → Report a vulnerability*.
   before any plaintext is produced.
 - **Clipboard hygiene** — secrets are cleared after a delay and marked as
   sensitive where the OS supports it.
+- **Log redaction** — passwords, keys, TOTP URIs, and similar values are
+  scrubbed before anything is written to `logs/kestrel.log`.
+- **Best-effort memory wiping** — key material is zeroed when possible when
+  the vault is locked. Python may still keep copies; this is not a guarantee.
 
 ## Known limitations
 
