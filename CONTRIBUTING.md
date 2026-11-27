@@ -96,14 +96,16 @@ Kestrel Vault separates a **pure-Python core** from a **Qt UI** so the core can 
 tested headlessly and reused from a CLI. The following modules **must not import
 `PySide6`**:
 
+- `kestrel_vault/cli.py`
 - `kestrel_vault/crypto.py`
+- `kestrel_vault/security.py`
 - `kestrel_vault/storage.py`
 - `kestrel_vault/models.py`
 - `kestrel_vault/passwords.py`
 - `kestrel_vault/importers.py`
 
-Qt widgets live under `kestrel_vault/ui/`, and `services.py` / `theme.py` /
-`icons.py` bridge the two.
+Qt widgets live under `kestrel_vault/ui/` (including `title_bar.py`), and
+`services.py` / `theme.py` / `icons.py` bridge the two.
 
 If your change needs a new capability from the core, add it to the core (with a
 test) and expose it through `session.py` or `services.py` — don't reach into Qt
@@ -134,6 +136,9 @@ If you're unsure, open the PR — style nits are easy to fix in review.
   `tmp_path`.
 - Prefer small, focused tests over one mega-test.
 - Name them `test_<what>_<expected>`.
+- Changes to `ui/title_bar.py` or native window flags need a real Windows
+  check too: resize edges/corners, Aero Snap, maximize/restore, and menu
+  clicks. Offscreen tests alone miss those.
 
 Run them before pushing:
 
