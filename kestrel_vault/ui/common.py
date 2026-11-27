@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import sys
-from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QKeyEvent, QPainter
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-                               QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+import shiboken6
+from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QSize, Qt, QTimer,
+                            QVariantAnimation, Signal)
+from PySide6.QtGui import QAction, QColor, QKeyEvent, QPainter, QPixmap, QRegion
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout, QLabel,
+                               QLineEdit, QListView, QMenu, QPlainTextEdit, QProgressBar,
+                               QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from .. import icons
 from ..passwords import Strength, estimate
@@ -45,6 +48,197 @@ def name_color(name: str) -> QColor:
     return QColor.fromHsv((h[0] << 8 | h[1]) % 360, 150, 205)
 
 
+# ---------------------------------------------------------------- smooth scrolling
+class _SmoothWheelHelper:
+    """Interpolates discrete mouse-wheel scrolling smoothly while leaving precision trackpads native."""
+
+    def _init_smooth_scroll(self) -> None:
+        self._scroll_anim: QPropertyAnimation | None = None
+        self._scroll_target: int = 0
+
+    def _handle_smooth_wheel(self, event, super_wheel) -> None:
+        bar = self.verticalScrollBar()  # type: ignore[attr-defined]
+        dy = event.angleDelta().y()
+        if (settings().reduced_motion or not event.pixelDelta().isNull()
+                or dy == 0 or bar.maximum() <= bar.minimum()):
+            super_wheel(event)
+            return
+
+        step = -dy / 120.0 * 88.0
+        running = self._scroll_anim is not None and self._scroll_anim.state() == QPropertyAnimation.State.Running
+        base = self._scroll_target if running else bar.value()
+        target = int(round(max(bar.minimum(), min(bar.maximum(), base + step))))
+        self._scroll_target = target
+
+        if self._scroll_anim is not None:
+            self._scroll_anim.stop()
+        anim = QPropertyAnimation(bar, b"value", self)  # type: ignore[arg-type]
+        anim.setDuration(180)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(bar.value())
+        anim.setEndValue(target)
+        anim.start()
+        self._scroll_anim = anim
+        event.accept()
+
+
+class SmoothScrollArea(QScrollArea, _SmoothWheelHelper):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._init_smooth_scroll()
+
+    def wheelEvent(self, event) -> None:
+        self._handle_smooth_wheel(event, super().wheelEvent)
+
+
+class SmoothListView(QListView, _SmoothWheelHelper):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._init_smooth_scroll()
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+    def wheelEvent(self, event) -> None:
+        self._handle_smooth_wheel(event, super().wheelEvent)
+
+
+# ---------------------------------------------------------------- animated tab stack
+def _snapshot(widget: QWidget, bg_color: str) -> QPixmap:
+    """Render `widget` onto an opaque pixmap pre-filled with `bg_color`.
+
+    QWidget.grab() alone returns transparent pixels wherever the widget
+    inherits its background from a parent, which is what caused the 'flash
+    to a different colour' bug during tab transitions. Rendering only the
+    children onto a pre-filled pixmap guarantees full opacity.
+    """
+    dpr = widget.devicePixelRatioF()
+    size = widget.size()
+    pm = QPixmap(max(1, int(size.width() * dpr)), max(1, int(size.height() * dpr)))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(QColor(bg_color))
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    widget.render(painter, QPoint(0, 0), QRegion(), QWidget.RenderFlag.DrawChildren)
+    painter.end()
+    return pm
+
+
+class _TabTransitionOverlay(QWidget):
+    """Cross-fades and softly slides between cached, opaque page snapshots.
+
+    Both pixmaps are pre-composited onto an opaque background so the animation
+    can never reveal an unexpected colour. The new page is painted first at
+    (0, 0) with full opacity so every pixel of the widget is covered at every
+    animation phase, then the old page slides up/out on top.
+    """
+
+    finished = Signal()   # emitted before deleteLater() so the stack can drop its ref
+
+    def __init__(self, parent: QWidget, old_pm: QPixmap, new_pm: QPixmap, direction: int,
+                 shift: float = 18.0) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._old = old_pm
+        self._new = new_pm
+        self._dir = 1 if direction >= 0 else -1
+        self._shift = shift
+        self._p = 0.0
+        self._done = False
+        self.setGeometry(parent.rect())
+        self.show()
+        self.raise_()
+
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(200)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.valueChanged.connect(self._on_tick)
+        self._anim.finished.connect(self._finish)
+        self._anim.start()
+
+    def _on_tick(self, value) -> None:
+        self._p = float(value)
+        self.update()
+
+    def stop_now(self) -> None:
+        if self._done:
+            return
+        try:
+            self._anim.stop()
+        except RuntimeError:
+            pass
+        self._finish()
+
+    def _finish(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        self.hide()
+        self.finished.emit()
+        self.deleteLater()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        # Source mode replaces destination pixels instead of blending, so
+        # nothing from the widget's previous state or palette can leak through.
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(self.rect(), QColor(theme().colors["bg"]))
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+        # New page at its final position, fully opaque — guarantees full coverage.
+        p.setOpacity(1.0)
+        p.drawPixmap(0, 0, self._new)
+
+        # Old page slides up/out and fades. Because it's opaque, no gap can
+        # appear: whatever it stops covering is the new page underneath.
+        p.setOpacity(max(0.0, 1.0 - self._p))
+        p.drawPixmap(QPointF(0.0, -self._shift * self._dir * self._p), self._old)
+
+
+class AnimatedStack(QStackedWidget):
+    """QStackedWidget with directional slide + fade transition between tabs."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._overlay: _TabTransitionOverlay | None = None
+
+    def _clear_overlay(self) -> None:
+        ov = self._overlay
+        self._overlay = None
+        if ov is None:
+            return
+        if not shiboken6.isValid(ov):
+            return
+        ov.stop_now()
+
+    def _on_overlay_finished(self) -> None:
+        if self._overlay is self.sender():
+            self._overlay = None
+
+    def switch_to(self, widget: QWidget, direction: int = 1) -> None:
+        if widget is self.currentWidget():
+            return
+        self._clear_overlay()
+        if settings().reduced_motion or not self.isVisible() or self.width() <= 0 or self.currentWidget() is None:
+            self.setCurrentWidget(widget)
+            return
+        bg = theme().colors["bg"]
+        old_pm = _snapshot(self.currentWidget(), bg)
+        self.setCurrentWidget(widget)
+        new_pm = _snapshot(widget, bg)
+        overlay = _TabTransitionOverlay(self, old_pm, new_pm, direction)
+        overlay.finished.connect(self._on_overlay_finished)
+        self._overlay = overlay
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        ov = self._overlay
+        if ov is not None and shiboken6.isValid(ov):
+            ov.setGeometry(self.rect())
+
+
 # ---------------------------------------------------------------- icons
 class IconLabel(QLabel):
     def __init__(self, name: str, size: int = 18, color_key: str = "sub") -> None:
@@ -66,7 +260,7 @@ class IconButton(QPushButton):
     """A button whose icon follows the theme. Icon-only buttons get a compact square style."""
 
     def __init__(self, icon_name: str, text: str = "", variant: str = "", tooltip: str = "",
-                 checkable: bool = False, size: int = 36) -> None:
+                 checkable: bool = False, size: int = 34) -> None:
         super().__init__(text)
         self._icon_name = icon_name
         self._variant = variant or ("" if text else "icon")
@@ -76,6 +270,7 @@ class IconButton(QPushButton):
         self.setCheckable(checkable)
         if tooltip:
             self.setToolTip(tooltip)
+            self.setAccessibleName(text or tooltip)
         if self._variant == "icon":
             self.setFixedSize(size, size)
         if self._variant == "nav":
@@ -90,6 +285,45 @@ class IconButton(QPushButton):
     def retint(self) -> None:
         color = theme().icon_color(self._variant, self.isChecked())
         self.setIcon(icons.icon(self._icon_name, color, 18))
+
+
+class AnimatedMenu(QMenu):
+    """Popup menu with a short fade-in, skipped when reduced motion is enabled.
+
+    ``popup_at()`` keeps the whole popup inside the available screen area so
+    its contents are never clipped by a display edge.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._open_anim: QPropertyAnimation | None = None
+
+    def popup_at(self, pos: QPoint) -> None:
+        """Exec at `pos`, nudged inside the screen so nothing is clipped."""
+        self.exec(self._clamped(pos))
+
+    def _clamped(self, pos: QPoint) -> QPoint:
+        screen = self.screen() or QApplication.screenAt(pos)
+        if screen is None:
+            return pos
+        avail = screen.availableGeometry()
+        size = self.sizeHint()
+        left = avail.left() + 4
+        top = avail.top() + 4
+        x = min(max(pos.x(), left), max(left, avail.right() - size.width() - 4))
+        y = min(max(pos.y(), top), max(top, avail.bottom() - size.height() - 4))
+        return QPoint(x, y)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if settings().reduced_motion or not self.isVisible():
+            return
+        self._open_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._open_anim.setDuration(130)
+        self._open_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._open_anim.setStartValue(0.0)
+        self._open_anim.setEndValue(1.0)
+        self._open_anim.start()
 
 
 # ---------------------------------------------------------------- password field
@@ -107,14 +341,7 @@ def caps_from_event(event: QKeyEvent) -> bool | None:
 
 
 def system_caps_lock() -> bool | None:
-    """Current Caps Lock toggle state, or None if the platform can't tell us.
-
-    GetKeyState's low bit is the toggle state; GetAsyncKeyState's low bit is
-    only a one-shot "pressed since last call" flag, which is why the warning
-    used to flicker off right after a press. GetKeyState lags behind until
-    the thread reads a key message, which the polling timer and the explicit
-    Key_CapsLock handler compensate for.
-    """
+    """Current Caps Lock toggle state, or None if the platform can't tell us."""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -125,47 +352,93 @@ def system_caps_lock() -> bool | None:
 
 
 class PasswordField(QLineEdit):
+    """Password input with toggleable reveal or hold-to-reveal."""
     capsChanged = Signal(bool)
 
-    def __init__(self, placeholder: str = "", read_only: bool = False) -> None:
+    def __init__(self, placeholder: str = "", read_only: bool = False,
+                 hold_to_reveal: bool = False, inline: bool = False) -> None:
         super().__init__()
-        self.setEchoMode(QLineEdit.EchoMode.Password)
+        self._hold_to_reveal = hold_to_reveal
+        self._revealed = False
         self.setReadOnly(read_only)
+        if inline:
+            self.setProperty("inline", "true")
         if placeholder:
             self.setPlaceholderText(placeholder)
-        self._reveal = QAction(self)
-        self._reveal.setCheckable(True)
-        self._reveal.setToolTip("Show / hide")
-        self._reveal.toggled.connect(self._on_toggle)
-        self.addAction(self._reveal, QLineEdit.ActionPosition.TrailingPosition)
+
+        if hold_to_reveal:
+            self._apply_echo(False)
+            self._hold_btn: QToolButton | None = QToolButton(self)
+            self._hold_btn.setProperty("variant", "icon")
+            self._hold_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._hold_btn.setFixedSize(28, 28)
+            self._hold_btn.setIconSize(QSize(18, 18))
+            self._hold_btn.setToolTip("Hold to reveal password")
+            self._hold_btn.setAccessibleName("Hold to reveal password")
+            self._hold_btn.pressed.connect(lambda: self.set_revealed(True))
+            self._hold_btn.released.connect(lambda: self.set_revealed(False))
+            self.setTextMargins(0, 0, 32, 0)
+            self._reveal: QAction | None = None
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.connect(self._on_app_state)
+        else:
+            self._hold_btn = None
+            self._reveal = QAction(self)
+            self._reveal.setCheckable(True)
+            self._reveal.setToolTip("Show / hide")
+            self._reveal.toggled.connect(self._on_toggle)
+            self.addAction(self._reveal, QLineEdit.ActionPosition.TrailingPosition)
+            self._apply_echo(False)
+
         theme().changed.connect(self._retint)
         self._retint()
 
-        # Caps Lock reporting: poll while focused so the warning appears the
-        # instant the field is focused (or the key is toggled), not on first key.
         self._caps_state: bool | None = None
         self._caps_timer = QTimer(self)
         self._caps_timer.setInterval(200)
         self._caps_timer.timeout.connect(self._poll_caps)
 
+    def _on_app_state(self, state: Qt.ApplicationState) -> None:
+        if state != Qt.ApplicationState.ApplicationActive and self._revealed:
+            self.set_revealed(False)
+
+    def _apply_echo(self, revealed: bool) -> None:
+        self._revealed = revealed
+        self.setEchoMode(QLineEdit.EchoMode.Normal if revealed else QLineEdit.EchoMode.Password)
+
     def _on_toggle(self, on: bool) -> None:
-        self.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
+        self._apply_echo(on)
         self._retint()
 
     def _retint(self) -> None:
-        name = "eye-off" if self._reveal.isChecked() else "eye"
-        self._reveal.setIcon(icons.icon(name, theme().colors["sub"], 18))
+        name = "eye-off" if self._revealed else "eye"
+        ic = icons.icon(name, theme().colors["sub"], 18)
+        if self._reveal is not None:
+            self._reveal.setIcon(ic)
+        if self._hold_btn is not None:
+            self._hold_btn.setIcon(ic)
 
     def set_revealed(self, on: bool) -> None:
-        self._reveal.setChecked(on)
+        if self._reveal is not None:
+            self._reveal.setChecked(on)
+        else:
+            self._apply_echo(on)
+            self._retint()
 
     def reset(self) -> None:
         self.clear()
-        self._reveal.setChecked(False)
+        self.set_revealed(False)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._hold_btn is not None:
+            x = self.width() - self._hold_btn.width() - 4
+            y = (self.height() - self._hold_btn.height()) // 2
+            self._hold_btn.move(x, y)
 
     # ---- caps lock
     def _emit_caps(self, state: bool | None) -> None:
-        """Emit only when the value actually changes, so listeners don't flicker."""
         if state is None or state == self._caps_state:
             return
         self._caps_state = state
@@ -175,11 +448,8 @@ class PasswordField(QLineEdit):
         self._emit_caps(system_caps_lock())
 
     def _on_caps_key(self) -> None:
-        """CapsLock was pressed while focused: the toggle state just flipped."""
         current = self._caps_state
         if current is None:
-            # No tracked state yet; fall back to GetKeyState, which is
-            # current now because the CapsLock key message was just read.
             current = bool(system_caps_lock())
         self._emit_caps(not current)
 
@@ -202,6 +472,13 @@ class PasswordField(QLineEdit):
         super().focusOutEvent(event)
         self._caps_timer.stop()
         self._emit_caps(False)
+        if self._hold_to_reveal and self._revealed:
+            self.set_revealed(False)
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        if self._hold_to_reveal and self._revealed:
+            self.set_revealed(False)
 
 
 # ---------------------------------------------------------------- strength meter
@@ -210,13 +487,13 @@ class StrengthMeter(QWidget):
         super().__init__()
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(10)
+        row.setSpacing(8)
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
         self.bar.setTextVisible(False)
         self.bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.text = QLabel("")
-        self.text.setMinimumWidth(78)
+        self.text.setMinimumWidth(84)
         self.text.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(self.bar, 1)
         row.addWidget(self.text)
@@ -228,17 +505,18 @@ class StrengthMeter(QWidget):
         level = str(s.score) if s.score >= 0 else ""
         if level != self._level:
             self.bar.setProperty("level", level)
+            self.text.setProperty("strength", level)
             repolish(self.bar)
+            repolish(self.text)
             self._level = level
         self.text.setText(s.label)
-        self.text.setStyleSheet(f"color:{s.color}; font-weight:600;" if s.label else "")
         if self._anim is not None:
             self._anim.stop()
         if settings().reduced_motion:
             self.bar.setValue(s.pct)
         else:
             self._anim = QPropertyAnimation(self.bar, b"value", self)
-            self._anim.setDuration(240)
+            self._anim.setDuration(180)
             self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
             self._anim.setStartValue(self.bar.value())
             self._anim.setEndValue(s.pct)
@@ -246,9 +524,9 @@ class StrengthMeter(QWidget):
         return s
 
 
-# ---------------------------------------------------------------- read-only field row
+# ---------------------------------------------------------------- read-only field row (inline box style)
 class FieldRow(QWidget):
-    """Label above a read-only value, with copy / open buttons. Built once, updated often."""
+    """Label above a recessed read-only box with inline eye/copy/open actions."""
 
     copyRequested = Signal()
     openRequested = Signal()
@@ -258,30 +536,38 @@ class FieldRow(QWidget):
         super().__init__()
         col = QVBoxLayout(self)
         col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(4)
+        col.setSpacing(6)
         col.addWidget(label(title, "small"))
-        row = QHBoxLayout()
-        row.setSpacing(6)
+
+        box = QFrame()
+        box.setProperty("fieldBox", "true")
+        row = QHBoxLayout(box)
+        row.setContentsMargins(4, 2, 6, 2)
+        row.setSpacing(2)
+
         if multiline:
             self.field: QLineEdit | QPlainTextEdit = QPlainTextEdit()
             self.field.setReadOnly(True)
-            self.field.setFixedHeight(96)
+            self.field.setProperty("inline", "true")
+            self.field.setFixedHeight(92)
         elif secret:
-            self.field = PasswordField(read_only=True)
+            self.field = PasswordField(read_only=True, hold_to_reveal=True, inline=True)
         else:
             self.field = QLineEdit()
             self.field.setReadOnly(True)
+            self.field.setProperty("inline", "true")
         row.addWidget(self.field, 1)
+
         self._copy_btn: IconButton | None = None
+        if can_open:
+            op = IconButton("external", tooltip="Open in browser", size=30)
+            op.clicked.connect(self.openRequested)
+            row.addWidget(op, 0, Qt.AlignmentFlag.AlignTop if multiline else Qt.AlignmentFlag.AlignVCenter)
         if can_copy:
-            self._copy_btn = IconButton("copy", tooltip=f"Copy {title.lower()}")
+            self._copy_btn = IconButton("copy", tooltip=f"Copy {title.lower()}", size=30)
             self._copy_btn.clicked.connect(self.copyRequested)
             row.addWidget(self._copy_btn, 0, Qt.AlignmentFlag.AlignTop if multiline else Qt.AlignmentFlag.AlignVCenter)
-        if can_open:
-            op = IconButton("external", tooltip="Open in browser")
-            op.clicked.connect(self.openRequested)
-            row.addWidget(op)
-        col.addLayout(row)
+        col.addWidget(box)
 
     def set_value(self, text: str) -> None:
         if isinstance(self.field, QPlainTextEdit):
@@ -300,7 +586,7 @@ class FieldRow(QWidget):
         if self._copy_btn is None:
             return
         self._copy_btn.set_icon_name("check")
-        QTimer.singleShot(1200, lambda: self._copy_btn.set_icon_name("copy"))
+        QTimer.singleShot(1400, lambda: self._copy_btn.set_icon_name("copy"))
 
 
 # ---------------------------------------------------------------- empty state
@@ -309,7 +595,7 @@ class EmptyState(QWidget):
         super().__init__()
         col = QVBoxLayout(self)
         col.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        col.setSpacing(10)
+        col.setSpacing(8)
         self.icon = IconLabel(icon_name, 44)
         self.title = label(title, "h2")
         self.text = label(text, "muted", wrap=True)
@@ -321,13 +607,17 @@ class EmptyState(QWidget):
         col.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignCenter)
         col.addWidget(self.title)
         col.addWidget(self.text, 0, Qt.AlignmentFlag.AlignCenter)
-        col.addSpacing(6)
+        col.addSpacing(8)
         col.addWidget(self.action, 0, Qt.AlignmentFlag.AlignCenter)
 
-    def set_content(self, icon_name: str, title: str, text: str, action: bool = False) -> None:
+    def set_content(self, icon_name: str, title: str, text: str,
+                    action: bool = False, action_text: str = "Add entry",
+                    action_icon: str = "plus") -> None:
         self.icon.set_name(icon_name)
         self.title.setText(title)
         self.text.setText(text)
+        self.action.setText(action_text)
+        self.action.set_icon_name(action_icon)
         self.action.setVisible(action)
 
 

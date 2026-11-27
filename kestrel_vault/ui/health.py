@@ -4,13 +4,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QListWidget, QListWidgetItem, QScrollArea,
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QListWidget, QListWidgetItem,
                                QVBoxLayout, QWidget)
 
 from ..models import health_report
 from ..services import theme
 from ..theme import PAD
-from .common import IconButton, IconLabel, card, label
+from .common import IconButton, IconLabel, SmoothScrollArea, card, label
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -62,7 +62,7 @@ class HealthTab(QWidget):
         self.main = main
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
+        scroll = SmoothScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         outer.addWidget(scroll)
@@ -110,15 +110,18 @@ class HealthTab(QWidget):
         report = health_report(list(self.main.session.entries.values()))
         if report.total == 0:
             self.score.setText("–")
+            self.score.setProperty("strength", "")
             self.headline.setText("No passwords to analyse yet")
             self.detail.setText("Add some entries and a report will appear here.")
         else:
-            color = "#22c55e" if report.score >= 80 else "#f59e0b" if report.score >= 50 else "#ef4444"
+            level = "3" if report.score >= 80 else "2" if report.score >= 50 else "0"
             self.score.setText(f"{report.score}%")
-            self.score.setStyleSheet(f"color:{color};")
+            self.score.setProperty("strength", level)
             self.headline.setText("Looking good" if report.flagged == 0
                                   else f"{report.flagged} of {report.total} passwords need attention")
             self.detail.setText("Select an entry below to open it. Reports are computed on this device only.")
+        self.score.style().unpolish(self.score)
+        self.score.style().polish(self.score)
         self.weak.set_entries(report.weak)
         self.reused.set_entries(report.reused)
         self.old.set_entries(report.old)

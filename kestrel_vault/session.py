@@ -1,15 +1,19 @@
 """The unlocked vault: in-memory entries plus debounced, atomic persistence."""
 from __future__ import annotations
 
+import base64
 import gc
+import hmac
 import logging
+import os
 
 from PySide6.QtCore import QObject, Signal
 
-from .crypto import KDF_PARAMS
+from .crypto import KDF_PARAMS, generate_dek, wrap_dek_with_recovery
 from .models import Entry, expired_trash, now_iso
+from .security import wipe_bytes, wipe_entry
 from .services import Debouncer
-from .storage import VaultFile, VaultHeader, serialize
+from .storage import VaultFile, VaultHeader, rewrap_vault, serialize
 
 log = logging.getLogger(__name__)
 
@@ -21,8 +25,11 @@ class VaultSession(QObject):
     def __init__(self, store: VaultFile) -> None:
         super().__init__()
         self.store = store
-        self.key: bytes | None = None
+        self._kek: bytearray | None = None
+        self._dek: bytearray | None = None
         self.header: VaultHeader | None = None
+        self.recovery_salt_b64: str | None = None
+        self.recovery_wrapped_dek: str | None = None
         self.entries: dict[str, Entry] = {}
         self._undo: list[str] = []
         self._saver = Debouncer(self, 600, self.persist_now)
@@ -30,32 +37,80 @@ class VaultSession(QObject):
     # ---- lifecycle
     @property
     def unlocked(self) -> bool:
-        return self.key is not None
+        return self._kek is not None and self._dek is not None
 
-    def create(self, key: bytes, header: VaultHeader) -> None:
-        """Create a brand-new vault in one atomic write. Raises OSError on failure."""
-        self.store.write(serialize(key, header.salt_b64, header.kdf, []), keep_backup=False)
-        self.key, self.header, self.entries, self._undo = key, header, {}, []
+    @property
+    def has_recovery(self) -> bool:
+        return bool(self.recovery_salt_b64 and self.recovery_wrapped_dek)
 
-    def open(self, key: bytes, header: VaultHeader, entries: list[Entry], migrated: bool) -> None:
-        self.key, self.header = key, header
+    def verify_kek(self, candidate: bytes) -> bool:
+        if self._kek is None:
+            return False
+        return hmac.compare_digest(bytes(self._kek), candidate)
+
+    def create(self, raw_kek: bytes, header: VaultHeader, recovery_code: str | None = None) -> None:
+        """Create a brand-new v4 vault in one atomic write. Raises OSError on failure."""
+        dek = generate_dek()
+        rsalt_b64: str | None = None
+        rwrapped: str | None = None
+        if recovery_code:
+            rsalt = os.urandom(16)
+            rsalt_b64 = base64.b64encode(rsalt).decode("ascii")
+            rwrapped = wrap_dek_with_recovery(recovery_code, dek, rsalt)
+        data = serialize(raw_kek, dek, header.salt_b64, header.kdf, [], rsalt_b64, rwrapped)
+        self.store.write(data, keep_backup=False)
+        header.data = data
+        self._kek = bytearray(raw_kek)
+        self._dek = bytearray(dek)
+        self.header = header
+        self.recovery_salt_b64 = rsalt_b64
+        self.recovery_wrapped_dek = rwrapped
+        self.entries = {}
+        self._undo = []
+
+    def open(self, raw_kek: bytes, dek: bytes, header: VaultHeader,
+             entries: list[Entry], migrated: bool) -> None:
+        self._kek = bytearray(raw_kek)
+        self._dek = bytearray(dek)
+        self.header = header
+        self.recovery_salt_b64 = header.data.get("recovery_salt") or None
+        self.recovery_wrapped_dek = header.data.get("recovery_wrapped_dek") or None
         self.entries = {e.id: e for e in entries}
         self._undo = []
+
+        # FIX: wipe + persist expired-trash purges (was: silent `del`, no save).
+        purged = False
         for e in expired_trash(list(self.entries.values())):
-            del self.entries[e.id]
+            wipe_entry(self.entries.pop(e.id, None))
+            purged = True
+
         if migrated:
-            try:
-                self.store.backup_legacy()
-            except OSError as exc:
-                log.warning("Could not back up legacy vault: %s", type(exc).__name__)
+            if header.schema < 4:
+                try:
+                    self.store.backup_legacy()
+                except OSError as exc:
+                    log.warning("Could not back up legacy vault: %s", type(exc).__name__)
+            self.header = VaultHeader(
+                header.salt, dict(KDF_PARAMS), header.data,
+                schema=4, cipher="aes-256-gcm",
+            )
+            self.persist_now()
+        elif purged:
             self.persist_now()
 
     def lock(self) -> None:
         self._saver.flush()
-        self.key = None
+        wipe_bytes(self._kek)
+        wipe_bytes(self._dek)
+        self._kek = None
+        self._dek = None
         self.header = None
-        self.entries = {}
-        self._undo = []
+        self.recovery_salt_b64 = None
+        self.recovery_wrapped_dek = None
+        for entry in self.entries.values():
+            wipe_entry(entry)
+        self.entries.clear()
+        self._undo.clear()
         gc.collect()
 
     # ---- persistence
@@ -63,8 +118,15 @@ class VaultSession(QObject):
         self._saver.cancel()
         if not self.unlocked or self.header is None:
             return False
+        assert self._kek is not None and self._dek is not None
         try:
-            self.store.write(serialize(self.key, self.header.salt_b64, self.header.kdf, self.entries))
+            data = serialize(
+                bytes(self._kek), bytes(self._dek),
+                self.header.salt_b64, self.header.kdf, self.entries,
+                self.recovery_salt_b64, self.recovery_wrapped_dek,
+            )
+            self.store.write(data)
+            self.header.data = data
             return True
         except OSError as exc:
             log.error("Saving failed: %s", type(exc).__name__)
@@ -74,14 +136,29 @@ class VaultSession(QObject):
     def persist_soon(self) -> None:
         self._saver.trigger()
 
-    def change_master(self, new_key: bytes, new_salt_b64: str) -> None:
-        """Re-encrypt under a new key. The file is only replaced if the write succeeds."""
-        assert self.header is not None
-        import base64
-        data = serialize(new_key, new_salt_b64, dict(KDF_PARAMS), self.entries)
+    def change_master(self, new_raw_kek: bytes, new_salt_b64: str) -> None:
+        """Re-wrap the DEK under a new master KEK without re-encrypting the vault payload."""
+        assert self.header is not None and self._dek is not None
+        dek_bytes = bytes(self._dek)
+        if self.header.data.get("wrapped_dek") and self.header.data.get("vault_blob"):
+            data = rewrap_vault(self.header.data, new_raw_kek, new_salt_b64, dict(KDF_PARAMS), dek_bytes)
+        else:
+            data = serialize(
+                new_raw_kek, dek_bytes, new_salt_b64, dict(KDF_PARAMS), self.entries,
+                self.recovery_salt_b64, self.recovery_wrapped_dek,
+            )
         self.store.write(data)
-        self.key = new_key
+        wipe_bytes(self._kek)
+        self._kek = bytearray(new_raw_kek)
         self.header = VaultHeader(base64.b64decode(new_salt_b64), dict(KDF_PARAMS), data)
+
+    def set_recovery_key(self, recovery_code: str) -> None:
+        """Bind a new offline recovery key to the current DEK and persist."""
+        assert self._dek is not None
+        rsalt = os.urandom(16)
+        self.recovery_salt_b64 = base64.b64encode(rsalt).decode("ascii")
+        self.recovery_wrapped_dek = wrap_dek_with_recovery(recovery_code, bytes(self._dek), rsalt)
+        self.persist_now()
 
     # ---- queries
     def get(self, entry_id: str | None) -> Entry | None:
@@ -104,8 +181,10 @@ class VaultSession(QObject):
         self._after_change()
 
     def add_many(self, entries: list[Entry]) -> None:
+        # FIX: dead `e.pw_changed = e.pw_changed or None` removed. Imported
+        # entries keep pw_changed=None on purpose so health_report falls back
+        # to `created` for staleness.
         for e in entries:
-            e.pw_changed = e.pw_changed or None
             self.entries[e.id] = e
         self._after_change()
 
@@ -130,6 +209,9 @@ class VaultSession(QObject):
         if e and not e.is_deleted:
             e.deleted_at = now_iso()
             self._undo.append(entry_id)
+            # FIX: bound the undo stack so a long session cannot leak memory.
+            if len(self._undo) > 100:
+                self._undo = self._undo[-100:]
             self._after_change()
 
     def can_undo(self) -> bool:
@@ -151,13 +233,15 @@ class VaultSession(QObject):
             self._after_change()
 
     def purge(self, entry_id: str) -> None:
-        if self.entries.pop(entry_id, None) is not None:
+        entry = self.entries.pop(entry_id, None)
+        if entry is not None:
+            wipe_entry(entry)
             self._after_change()
 
     def empty_trash(self) -> int:
         ids = [e.id for e in self.trashed()]
         for i in ids:
-            del self.entries[i]
+            wipe_entry(self.entries.pop(i, None))
         if ids:
             self._after_change()
         return len(ids)

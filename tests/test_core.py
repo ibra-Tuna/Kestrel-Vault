@@ -1,21 +1,57 @@
+import ast
 import base64
 import json
+import logging
 import os
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kestrel_vault import crypto, models, passwords, storage, importers  # noqa: E402
+from kestrel_vault import cli, crypto, importers, models, passwords, security, storage  # noqa: E402
 from kestrel_vault.models import Entry  # noqa: E402
 
 
 # ------------------------------------------------------------ crypto / TOTP
-def test_roundtrip_and_wrong_key():
+def test_gcm_roundtrip_and_wrong_key():
+    k1, k2 = crypto.generate_dek(), crypto.generate_dek()
+    blob = crypto.encrypt_gcm(k1, {"a": 1})
+    assert crypto.decrypt_gcm(k1, blob) == {"a": 1}
+    with pytest.raises(crypto.WrongPasswordError):
+        crypto.decrypt_gcm(k2, blob)
+
+
+def test_gcm_garbage_blob_is_not_reported_as_wrong_password():
+    with pytest.raises(crypto.CorruptVaultError):
+        crypto.decrypt_gcm(crypto.generate_dek(), "###not-base64###")
+
+
+def test_envelope_wrap_and_unwrap():
+    kek1, kek2 = crypto.generate_dek(), crypto.generate_dek()
+    dek = crypto.generate_dek()
+    wrapped = crypto.wrap_key(kek1, dek)
+    assert crypto.unwrap_key(kek1, wrapped) == dek
+    with pytest.raises(crypto.WrongPasswordError):
+        crypto.unwrap_key(kek2, wrapped)
+
+
+def test_recovery_key_roundtrip_and_wrong_code():
+    code = crypto.generate_recovery_key()
+    assert code.startswith("KVLT-")
+    dek = crypto.generate_dek()
+    salt = os.urandom(16)
+    wrapped = crypto.wrap_dek_with_recovery(code, dek, salt)
+    assert crypto.unwrap_dek_with_recovery(code.lower().replace("-", " "), wrapped, salt) == dek
+    with pytest.raises(crypto.WrongPasswordError):
+        crypto.unwrap_dek_with_recovery("KVLT-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA", wrapped, salt)
+
+
+def test_roundtrip_and_wrong_key_legacy_fernet():
     k1, k2 = Fernet.generate_key(), Fernet.generate_key()
     blob = crypto.encrypt_dict(k1, {"a": 1})
     assert crypto.decrypt_dict(k1, blob) == {"a": 1}
@@ -28,7 +64,8 @@ def test_garbage_blob_is_not_reported_as_wrong_password():
         crypto.decrypt_dict(Fernet.generate_key(), "###not-base64###")
 
 
-def test_kdf_params_are_clamped():
+def test_kdf_params_default_256mib_and_clamped():
+    assert crypto.KDF_PARAMS["m"] == 262144
     p = crypto.normalize_kdf({"t": 9999, "m": 1, "p": "x"})
     assert p["t"] == 10 and p["m"] == 8192 and p["p"] == 4
 
@@ -47,6 +84,48 @@ def test_totp_validation_and_spaces():
     assert not crypto.is_valid_totp("")
     assert crypto.totp_code("???") == ""
     assert 1 <= crypto.totp_remaining() <= 30
+
+
+# ------------------------------------------------------------ security & network isolation
+def test_network_isolation_no_network_imports():
+    forbidden = {
+        "requests", "httpx", "aiohttp", "urllib.request", "urllib3",
+        "socket", "http", "http.client", "ftplib", "smtplib", "ssl", "webbrowser",
+    }
+    pkg_dir = Path(__file__).resolve().parent.parent / "kestrel_vault"
+    violations: list[str] = []
+    for py_file in pkg_dir.rglob("*.py"):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in forbidden or alias.name.split(".")[0] in {"requests", "httpx", "aiohttp", "urllib3", "socket", "http", "ftplib", "smtplib", "ssl", "webbrowser"}:
+                        violations.append(f"{py_file.name}: import {alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                mod = node.module
+                if mod in forbidden or mod.split(".")[0] in {"requests", "httpx", "aiohttp", "urllib3", "socket", "http", "ftplib", "smtplib", "ssl", "webbrowser"}:
+                    violations.append(f"{py_file.name}: from {mod} import ...")
+    assert violations == []
+
+
+def test_log_redacting_filter():
+    flt = security.SecretRedactingFilter()
+    rec = logging.LogRecord(
+        "test", logging.ERROR, "x.py", 1,
+        "password=supersecret token=gAAAAA123456789012345678901234567890 uri=otpauth://totp/a?secret=ABC key=KVLT-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH",
+        (), None,
+    )
+    assert flt.filter(rec)
+    assert "supersecret" not in rec.msg
+    assert "gAAAAA1234567890" not in rec.msg
+    assert "secret=ABC" not in rec.msg
+    assert "KVLT-AAAA" not in rec.msg
+
+
+def test_wipe_bytes_zeroes_buffer():
+    buf = bytearray(b"sensitive-key-material-32-bytes!")
+    security.wipe_bytes(buf)
+    assert buf == bytearray(len(buf))
 
 
 # ------------------------------------------------------------ passwords
@@ -145,44 +224,74 @@ def test_expired_trash():
     assert models.expired_trash([keep, drop, live]) == [drop]
 
 
-# ------------------------------------------------------------ storage
+# ------------------------------------------------------------ storage & CLI
 def make_store(tmp_path):
     return storage.VaultFile(tmp_path)
 
 
-def test_new_vault_flow_and_open(tmp_path):
+def test_new_v4_vault_flow_and_open(tmp_path):
     store = make_store(tmp_path)
     assert store.is_new()
-    key = Fernet.generate_key()
+    kek = crypto.generate_dek()
+    dek = crypto.generate_dek()
     header = store.new_header()
-    store.write(storage.serialize(key, header.salt_b64, header.kdf, [Entry(name="A", password="x")]))
+    rec = crypto.generate_recovery_key()
+    rsalt = os.urandom(16)
+    data = storage.serialize(
+        kek, dek, header.salt_b64, header.kdf, [Entry(name="A", password="x")],
+        base64.b64encode(rsalt).decode(), crypto.wrap_dek_with_recovery(rec, dek, rsalt),
+    )
+    store.write(data)
     assert not store.is_new()
     h2 = store.load_header()
-    entries, migrated = store.open_with_key(h2, key)
-    assert [e.name for e in entries] == ["A"] and not migrated
+    entries, dek2, migrated = store.open_with_key(h2, kek)
+    assert [e.name for e in entries] == ["A"] and dek2 == dek and not migrated
+    entries_rec, dek_rec = store.open_with_recovery(h2, rec)
+    assert [e.name for e in entries_rec] == ["A"] and dek_rec == dek
+
+
+def test_rewrap_vault_changes_kek_without_reencrypting_blob():
+    kek1, kek2, dek = crypto.generate_dek(), crypto.generate_dek(), crypto.generate_dek()
+    salt1 = base64.b64encode(os.urandom(16)).decode()
+    salt2 = base64.b64encode(os.urandom(16)).decode()
+    v4 = storage.serialize(kek1, dek, salt1, crypto.KDF_PARAMS, [Entry(name="Site", password="pw")])
+    rewrapped = storage.rewrap_vault(v4, kek2, salt2, crypto.KDF_PARAMS, dek)
+    assert rewrapped["vault_blob"] == v4["vault_blob"]
+    assert crypto.unwrap_key(kek2, rewrapped["wrapped_dek"]) == dek
+
+
+def test_kdf_mismatch_triggers_migration_flag(tmp_path):
+    store = make_store(tmp_path)
+    kek, dek = crypto.generate_dek(), crypto.generate_dek()
+    salt = base64.b64encode(os.urandom(16)).decode()
+    old_kdf = {"type": "argon2id", "t": 3, "m": 65536, "p": 4}
+    store.write(storage.serialize(kek, dek, salt, old_kdf, []))
+    entries, dek2, migrated = store.open_with_key(store.load_header(), kek)
+    assert entries == [] and dek2 == dek and migrated
 
 
 def test_wrong_key_does_not_modify_file(tmp_path):
     store = make_store(tmp_path)
-    key = Fernet.generate_key()
+    kek, dek = crypto.generate_dek(), crypto.generate_dek()
     header = store.new_header()
-    store.write(storage.serialize(key, header.salt_b64, header.kdf, []))
+    store.write(storage.serialize(kek, dek, header.salt_b64, header.kdf, []))
     before = store.path.read_bytes()
     with pytest.raises(crypto.WrongPasswordError):
-        store.open_with_key(store.load_header(), Fernet.generate_key())
+        store.open_with_key(store.load_header(), crypto.generate_dek())
     assert store.path.read_bytes() == before
 
 
-def test_legacy_v2_file_is_readable(tmp_path):
+def test_legacy_v2_file_is_readable_and_marked_for_migration(tmp_path):
     store = make_store(tmp_path)
-    key = Fernet.generate_key()
+    raw = crypto.generate_dek()
+    fkey = crypto.fernet_key_from_raw(raw)
     salt = base64.b64encode(os.urandom(16)).decode()
-    legacy = {"schema": 2, "salt": salt, "kdf": crypto.KDF_PARAMS,
-              "canary": crypto.encrypt_dict(key, {"status": "verified"}),
-              "vault_blob": crypto.encrypt_dict(key, {"Site": {"username": "u", "password": "p"}})}
+    legacy = {"schema": 2, "salt": salt, "kdf": {"type": "argon2id", "t": 3, "m": 65536, "p": 4},
+              "canary": crypto.encrypt_dict(fkey, {"status": "verified"}),
+              "vault_blob": crypto.encrypt_dict(fkey, {"Site": {"username": "u", "password": "p"}})}
     store.path.write_text(json.dumps(legacy))
-    entries, migrated = store.open_with_key(store.load_header(), key)
-    assert migrated and entries[0].name == "Site"
+    entries, new_dek, migrated = store.open_with_key(store.load_header(), raw)
+    assert migrated and len(new_dek) == 32 and entries[0].name == "Site"
     store.backup_legacy()
     assert store.legacy_bak.exists()
 
@@ -213,12 +322,36 @@ def test_write_keeps_backup_and_is_atomic(tmp_path):
 
 
 def test_validate_backup():
-    good = {"salt": base64.b64encode(os.urandom(16)).decode(), "vault_blob": "abc", "schema": 2}
-    assert storage.validate_backup(good) is good
-    for bad in ({}, {"salt": "!!", "vault_blob": "a"}, {**good, "vault_blob": ""},
-                {**good, "schema": 99}, {**good, "schema": "x"}, [1, 2]):
+    good_v2 = {"salt": base64.b64encode(os.urandom(16)).decode(), "vault_blob": "abc", "schema": 2}
+    good_v4 = {"salt": base64.b64encode(os.urandom(16)).decode(), "vault_blob": "abc", "wrapped_dek": "xyz", "schema": 4}
+    assert storage.validate_backup(good_v2) is good_v2
+    assert storage.validate_backup(good_v4) is good_v4
+    for bad in ({}, {"salt": "!!", "vault_blob": "a"}, {**good_v2, "vault_blob": ""},
+                {**good_v4, "wrapped_dek": ""}, {**good_v2, "schema": 99}, {**good_v2, "schema": "x"}, [1, 2]):
         with pytest.raises(ValueError):
             storage.validate_backup(bad)
+
+
+def test_cli_backup_verify_restore(tmp_path):
+    data_dir = tmp_path / "vault_data"
+    backup_file = tmp_path / "backup.json"
+    store = storage.VaultFile(data_dir)
+    kek, dek = crypto.generate_dek(), crypto.generate_dek()
+    header = store.new_header()
+    store.write(storage.serialize(kek, dek, header.salt_b64, header.kdf, [Entry(name="CLI", password="secret")]))
+
+    try:
+        handled, code = cli.run_cli(["--data-dir", str(data_dir), "verify"])
+        assert handled and code == 0
+
+        handled, code = cli.run_cli(["--data-dir", str(data_dir), "backup", str(backup_file)])
+        assert handled and code == 0 and backup_file.is_file()
+
+        store.path.unlink()
+        handled, code = cli.run_cli(["--data-dir", str(data_dir), "restore", str(backup_file), "--force"])
+        assert handled and code == 0 and store.path.is_file()
+    finally:
+        storage.set_data_dir(None)
 
 
 def test_wipe_removes_backups(tmp_path):

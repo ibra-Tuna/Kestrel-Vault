@@ -4,6 +4,30 @@ All notable changes to Kestrel Vault (the fork) are documented here.
 The upstream project's history is at
 https://github.com/Krahzin/BNDGG-Vault.
 
+## [3.1.0] — 2026-11-27
+
+### Changed
+
+- **Merged native-style title bar.** The menu bar, navigation-rail toggle,
+  app name, and window controls now share one custom top bar while Windows
+  still handles resize, Aero Snap, maximize/restore, and minimize.
+- **Keyboard-only focus rings.** Focus highlights appear only when navigating
+  with the keyboard, not after mouse clicks.
+- **Quieter lock/unlock flow.** The "Vault locked" and "Vault unlocked"
+  notifications were removed; recovery, copy, and error toasts remain.
+- **Centered app name.** The title stays centered across the whole window and
+  hides automatically on narrow windows where it would overlap the menus.
+- **Navigation rail toggle.** The rail button stays visible on every page;
+  `Ctrl+B` and the View menu action work everywhere, including Settings,
+  Generator, and Health.
+- **Refined menu spacing and baseline alignment** in the merged title bar.
+
+### Fixed
+
+- "Lock when in background = Never" no longer locks the vault on minimize.
+- No more atexit event-filter traceback during shutdown.
+- Context menus are clamped to the screen so they are never clipped on the left.
+
 ## [3.0.0] — 2026
 
 ### Added

@@ -5,14 +5,14 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QScrollArea, QSlider, QSpinBox, QStackedWidget,
+                               QLineEdit, QSlider, QSpinBox, QStackedWidget,
                                QVBoxLayout, QWidget)
 
 from ..passwords import (build_classes, entropy_label, entropy_passphrase, entropy_random,
                          generate_passphrase, generate_password, wordlist)
 from ..services import settings
 from ..theme import PAD
-from .common import IconButton, StrengthMeter, card, label
+from .common import IconButton, SmoothScrollArea, StrengthMeter, card, label
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -29,7 +29,7 @@ class GeneratorTab(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
+        scroll = SmoothScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         outer.addWidget(scroll)
@@ -60,8 +60,7 @@ class GeneratorTab(QWidget):
         self.output = QLineEdit()
         self.output.setReadOnly(True)
         self.output.setMinimumHeight(46)
-        self.output.setStyleSheet("font-family:'Cascadia Mono','JetBrains Mono',Consolas,Menlo,monospace;"
-                                  "font-size:16px; letter-spacing:0.5px;")
+        self.output.setProperty("mono", "true")
         row.addWidget(self.output, 1)
         self.regen = IconButton("refresh", tooltip="Generate again (Ctrl+G)")
         self.copy_btn = IconButton("copy", tooltip="Copy")
@@ -217,15 +216,21 @@ class GeneratorTab(QWidget):
                                          self.capitalize.isChecked(), self.number.isChecked())
                 bits = entropy_passphrase(self.words.value(), len(wordlist()), self.number.isChecked())
             except RuntimeError as exc:
+                # FIX: clear stale meter/entropy when the word list is missing.
                 self.output.clear()
                 self.error.setText(str(exc))
+                self.meter.set_password("")
+                self.entropy.setText("")
                 return
         self.output.setText(pw)
         self.output.setCursorPosition(0)
         self.meter.set_password(pw)
-        text, color = entropy_label(bits)
+        text, _color = entropy_label(bits)
+        level = "0" if bits < 50 else "2" if bits < 70 else "3" if bits < 90 else "4"
         self.entropy.setText(text)
-        self.entropy.setStyleSheet(f"color:{color};")
+        self.entropy.setProperty("strength", level)
+        self.entropy.style().unpolish(self.entropy)
+        self.entropy.style().polish(self.entropy)
 
     def copy(self) -> None:
         if self.output.text():

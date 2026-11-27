@@ -13,6 +13,7 @@ from PySide6.QtSvg import QSvgRenderer
 
 _BODIES: dict[str, str] = {
     "shield": '<path d="M12 3l8 3v6c0 4.5-3.2 8.2-8 9-4.8-.8-8-4.5-8-9V6z"/>',
+    "shield-check": '<path d="M12 3l8 3v6c0 4.5-3.2 8.2-8 9-4.8-.8-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/>',
     "lock": '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
     "vault": '<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="12" cy="12" r="3.5"/><path d="M12 8.5V10M12 14v1.5M8.5 12H10M14 12h1.5"/>',
     "dice": '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.1" fill="COLOR"/><circle cx="15" cy="9" r="1.1" fill="COLOR"/><circle cx="9" cy="15" r="1.1" fill="COLOR"/><circle cx="15" cy="15" r="1.1" fill="COLOR"/>',
@@ -41,8 +42,14 @@ _BODIES: dict[str, str] = {
     "undo": '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>',
     "folder": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
     "chevron-down": '<path d="M6 9l6 6 6-6"/>',
+    "sidebar": '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
     "file": '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>',
     "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.5"/>',
+    # window control glyphs (title bar)
+    "window-min": '<path d="M6 12h12"/>',
+    "window-max": '<rect x="6" y="6" width="12" height="12" rx="1.5"/>',
+    "window-restore": '<rect x="8" y="8" width="10" height="10" rx="1.5"/><path d="M5 5h11v3M5 5v11h3"/>',
+    "window-close": '<path d="M6 6l12 12M18 6L6 18"/>',
 }
 
 _cache: dict[tuple, QPixmap] = {}

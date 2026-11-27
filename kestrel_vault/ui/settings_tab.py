@@ -9,16 +9,18 @@ from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog,
                                QFrame, QGridLayout, QHBoxLayout, QListWidget, QListWidgetItem,
-                               QMessageBox, QPushButton, QScrollArea, QStyle, QStyledItemDelegate,
+                               QMessageBox, QPushButton, QStyle, QStyledItemDelegate,
                                QVBoxLayout, QWidget)
 
-from ..crypto import CorruptVaultError, VaultError, WrongPasswordError, derive_key
+from datetime import datetime
+
+from ..crypto import KDF_PARAMS, derive_raw_key, generate_recovery_key
 from ..importers import parse_csv
 from ..services import run_task, settings, theme
-from ..storage import validate_backup
+from ..storage import is_portable_mode, validate_backup
 from ..theme import ACCENTS, PAD, THEMES
-from .common import IconButton, PasswordField, card, label, section_label
-from .dialogs import ChangeMasterDialog, confirm
+from .common import IconButton, PasswordField, SmoothScrollArea, card, label, section_label
+from .dialogs import ChangeMasterDialog, RecoveryKitDialog, confirm
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -34,6 +36,13 @@ class ThemeDelegate(QStyledItemDelegate):
     """Paints each theme as a swatch card instead of embedding widgets in the list."""
 
     def sizeHint(self, option, index) -> QSize:
+        # Follow the view's grid so icon-mode cards stretch to the column width
+        # instead of leaving an empty strip on the right.
+        view = option.widget
+        if view is not None:
+            grid = view.gridSize()
+            if grid.isValid() and not grid.isEmpty():
+                return grid
         return QSize(150, 78)
 
     def paint(self, painter: QPainter, option, index) -> None:
@@ -66,6 +75,28 @@ class ThemeDelegate(QStyledItemDelegate):
         painter.drawText(QRect(r.left() + 12, r.bottom() - 30, r.width() - 24, 24),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
         painter.restore()
+
+
+class ThemeList(QListWidget):
+    """Theme swatch grid whose columns stretch to fill the available width."""
+
+    COLUMNS = 4
+    CELL_HEIGHT = 80
+    MIN_CELL_WIDTH = 110
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_columns()
+
+    def _fit_columns(self) -> None:
+        width = self.viewport().width()
+        if width <= 0:
+            return
+        # One pixel of slack keeps icon mode from wrapping the last column.
+        cell = max(self.MIN_CELL_WIDTH, (width - 1) // self.COLUMNS)
+        size = QSize(cell, self.CELL_HEIGHT)
+        if self.gridSize() != size:
+            self.setGridSize(size)
 
 
 class SwatchButton(QPushButton):
@@ -104,7 +135,7 @@ class SettingsTab(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
+        scroll = SmoothScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -127,8 +158,8 @@ class SettingsTab(QWidget):
         # ---- appearance
         ap, apl = self._section("Appearance")
         apl.addWidget(label("Theme", "small"))
-        self.theme_list = QListWidget()
-        self.theme_list.setObjectName("plainList")
+        self.theme_list = ThemeList()
+        self.theme_list.setObjectName("themeList")
         self.theme_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.theme_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.theme_list.setMovement(QListWidget.Movement.Static)
@@ -137,8 +168,8 @@ class SettingsTab(QWidget):
         self.theme_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.theme_list.setItemDelegate(ThemeDelegate(self.theme_list))
         self.theme_list.setFrameShape(QFrame.Shape.NoFrame)
-        self.theme_list.setStyleSheet("background: transparent;")
         self.theme_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.theme_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.theme_list.setSpacing(0)
         for name in THEMES:
             it = QListWidgetItem(name)
@@ -179,7 +210,7 @@ class SettingsTab(QWidget):
         for i, (text, hint, w) in enumerate((
             ("Auto-lock", "Lock after this much inactivity.", self.auto_lock),
             ("Clear clipboard", "Remove copied secrets after a delay.", self.clip),
-            ("Lock when in background", "Lock if the window loses focus for this long.", self.blur),
+            ("Lock when in background", "Lock after losing focus for this long, including minimize.", self.blur),
         )):
             lab = QVBoxLayout()
             lab.setSpacing(1)
@@ -188,19 +219,31 @@ class SettingsTab(QWidget):
             grid.addLayout(lab, i, 0)
             grid.addWidget(w, i, 1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         sl.addLayout(grid)
-        self.on_min = QCheckBox("Lock when the window is minimized")
-        self.on_min.setChecked(bool(s.get("lock_on_minimize")))
-        self.on_min.toggled.connect(lambda v: settings().set("lock_on_minimize", v))
-        sl.addWidget(self.on_min)
         self.change_btn = IconButton("key", "Change master password")
         self.change_btn.clicked.connect(self.change_master)
-        sl.addWidget(self.change_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.recovery_btn = IconButton("shield", "Generate recovery key")
+        self.recovery_btn.clicked.connect(self.regenerate_recovery)
+        sec_btns = QHBoxLayout()
+        sec_btns.setSpacing(8)
+        sec_btns.addWidget(self.change_btn)
+        sec_btns.addWidget(self.recovery_btn)
+        sec_btns.addStretch(1)
+        sl.addLayout(sec_btns)
         col.addWidget(sec)
 
         # ---- data
-        data, dl = self._section("Data")
-        dl.addWidget(label("Backups are encrypted copies of your vault. CSV import reads Bitwarden, "
-                           "1Password and browser exports; delete those files afterwards, they are not encrypted.",
+        data, dl = self._section("Data & Backups")
+        mode_note = "Portable mode active" if is_portable_mode() else "Standard storage"
+        self.storage_info = label(f"{mode_note}: {main.store.dir}", "small", wrap=True)
+        dl.addWidget(self.storage_info)
+        last_bak = s.get("last_backup_at", "")
+        self.backup_status = label(
+            f"Last encrypted backup: {last_bak[:10]}" if last_bak else "No backup exported from this app yet.",
+            "small",
+        )
+        dl.addWidget(self.backup_status)
+        dl.addWidget(label("Backups are encrypted copies of your vault. Store a copy on external media. "
+                           "CSV import reads Bitwarden, 1Password and browser exports; delete unencrypted CSVs afterwards.",
                            "muted", wrap=True))
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -239,7 +282,16 @@ class SettingsTab(QWidget):
         cb.setMinimumWidth(150)
         for text, value in choices:
             cb.addItem(text, value)
-        idx = max(0, cb.findData(current))
+        # FIX: settings.json may store the value as a string. Try a typed match
+        # first, then fall back to string comparison before defaulting to row 0.
+        idx = cb.findData(current)
+        if idx < 0:
+            for i in range(cb.count()):
+                if str(cb.itemData(i)) == str(current):
+                    idx = i
+                    break
+        if idx < 0:
+            idx = 0
         cb.setCurrentIndex(idx)
         cb.currentIndexChanged.connect(lambda _i, c=cb, k=key: settings().set(k, c.currentData()))
         return cb
@@ -249,13 +301,13 @@ class SettingsTab(QWidget):
         if row < 0:
             return
         settings().set("theme_name", list(THEMES)[row])
-        theme().apply()
+        self.main.apply_theme()
 
     def _on_accent(self, hexv: str) -> None:
         for b in self.swatches:
             b.setChecked(b.hex == hexv)
         settings().set("accent", hexv)
-        theme().apply()
+        self.main.apply_theme()
 
     # ---- master password
     def change_master(self) -> None:
@@ -271,12 +323,11 @@ class SettingsTab(QWidget):
 
         def work() -> tuple[bool, bytes | None, str]:
             import base64, os
-            key = derive_key(current, header.salt, header.kdf)
-            if key != sess.key:
+            key = derive_raw_key(current, header.salt, header.kdf)
+            if not sess.verify_kek(key):
                 return False, None, ""
             salt = os.urandom(16)
-            from ..crypto import KDF_PARAMS
-            return True, derive_key(new, salt, KDF_PARAMS), base64.b64encode(salt).decode()
+            return True, derive_raw_key(new, salt, KDF_PARAMS), base64.b64encode(salt).decode()
 
         def done(res) -> None:
             self.change_btn.setEnabled(True)
@@ -290,7 +341,7 @@ class SettingsTab(QWidget):
                 QMessageBox.critical(self.main, "Change master password",
                                      "The vault could not be saved. Your old password still works.")
                 return
-            self.main.toast("Master password changed", "#22c55e")
+            self.main.toast("Master password changed", "success")
 
         def failed(exc: Exception) -> None:
             self.change_btn.setEnabled(True)
@@ -298,6 +349,26 @@ class SettingsTab(QWidget):
             QMessageBox.critical(self.main, "Change master password", "Something went wrong. Nothing was changed.")
 
         run_task(work, on_done=done, on_fail=failed)
+
+    def regenerate_recovery(self) -> None:
+        sess = self.main.session
+        if not sess.unlocked:
+            return
+        if sess.has_recovery and not confirm(
+            self.main,
+            "Replace recovery key?",
+            "Generating a new recovery key will invalidate your previous recovery key.\n\nContinue?",
+            "Generate new key",
+        ):
+            return
+        code = generate_recovery_key()
+        if RecoveryKitDialog(self.main, code, allow_skip=True).exec():
+            try:
+                sess.set_recovery_key(code)
+            except OSError:
+                QMessageBox.critical(self.main, "Recovery key", "Could not save the recovery key.")
+                return
+            self.main.toast("Recovery key updated", "success")
 
     # ---- data
     def export_backup(self) -> None:
@@ -314,7 +385,11 @@ class SettingsTab(QWidget):
         except OSError as exc:
             QMessageBox.critical(self.main, "Export failed", f"Could not write the file: {exc.strerror or 'error'}")
             return
-        self.main.toast("Backup exported", "#22c55e")
+        now = datetime.now().isoformat(timespec="seconds")
+        settings().set("last_backup_at", now)
+        self.backup_status.setText(f"Last encrypted backup: {now[:10]}")
+        self.main.vault_tab.refresh_backup_banner()
+        self.main.toast("Backup exported", "success")
 
     def import_backup(self) -> None:
         sess = self.main.session
@@ -388,13 +463,13 @@ class SettingsTab(QWidget):
 
         def done(key) -> None:
             self.wipe_btn.setEnabled(True)
-            if key != sess.key:
+            if not sess.verify_kek(key):
                 QMessageBox.warning(self.main, "Delete everything", "Incorrect master password.")
                 return
             sess.lock()
             self.main.store.wipe()
             self.main.lock_vault(message="Vault deleted. You can create a new one.")
 
-        run_task(derive_key, pw, header.salt, header.kdf, on_done=done,
+        run_task(derive_raw_key, pw, header.salt, header.kdf, on_done=done,
                  on_fail=lambda e: (self.wipe_btn.setEnabled(True),
                                     QMessageBox.critical(self.main, "Delete everything", "Could not verify the password.")))

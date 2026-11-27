@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import struct
 import sys
 from typing import Any, Callable
@@ -14,6 +15,8 @@ from PySide6.QtWidgets import QApplication, QLabel, QWidget
 from . import theme as theme_mod
 from .storage import VaultFile, load_settings, save_settings
 
+log = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------- debounce
 class Debouncer(QObject):
@@ -25,7 +28,15 @@ class Debouncer(QObject):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(ms)
-        self._timer.timeout.connect(self._fn)
+        self._timer.timeout.connect(self._safe_call)
+
+    def _safe_call(self) -> None:
+        # FIX: never let a debounced callback propagate out of an event handler —
+        # uncaught exceptions from Qt slots can terminate the app.
+        try:
+            self._fn()
+        except Exception:
+            log.exception("debounced call failed")
 
     def trigger(self, *_: Any) -> None:
         self._timer.start()
@@ -36,7 +47,7 @@ class Debouncer(QObject):
     def flush(self) -> None:
         if self._timer.isActive():
             self._timer.stop()
-            self._fn()
+            self._safe_call()
 
     def cancel(self) -> None:
         self._timer.stop()
@@ -101,8 +112,10 @@ class ThemeManager(QObject):
             return c["on_accent"]
         if variant == "danger":
             return "#ffffff"
+        if variant == "danger-outline":
+            return c["danger"]
         if variant == "nav":
-            return c["on_accent"] if checked else c["sub"]
+            return c["nav_active_fg"] if checked else c["sub"]
         return c["fg"]
 
 
@@ -169,16 +182,23 @@ class ClipboardManager(QObject):
 
 # ---------------------------------------------------------------- toasts
 class Toast(QLabel):
-    def __init__(self, parent: QWidget, message: str, bg: str, fg: str) -> None:
+    def __init__(self, parent: QWidget, message: str, tone: str = "accent") -> None:
         super().__init__(message, parent)
+        self.setObjectName("toast")
+        self.setProperty("tone", tone)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setStyleSheet(
-            f"background:{bg}; color:{fg}; border-radius:12px; padding:11px 20px;"
-            "font-weight:600; font-size:13px;")
+        self.style().unpolish(self)
+        self.style().polish(self)
         self.adjustSize()
         self._anim: QPropertyAnimation | None = None
 
+    def _stop_anim(self) -> None:
+        if self._anim is not None:
+            self._anim.stop()
+            self._anim = None
+
     def slide_to(self, y: int, reduced: bool, from_below: bool = False) -> None:
+        self._stop_anim()
         x = (self.parentWidget().width() - self.width()) // 2
         target = QPoint(x, y)
         if reduced:
@@ -191,18 +211,19 @@ class Toast(QLabel):
         self.show()
         self.raise_()
         self._anim = QPropertyAnimation(self, b"pos", self)
-        self._anim.setDuration(260)
+        self._anim.setDuration(180)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.setStartValue(self.pos())
         self._anim.setEndValue(target)
         self._anim.start()
 
     def dismiss(self, reduced: bool) -> None:
+        self._stop_anim()
         if reduced:
             self.deleteLater()
             return
         self._anim = QPropertyAnimation(self, b"pos", self)
-        self._anim.setDuration(180)
+        self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.Type.InCubic)
         self._anim.setStartValue(self.pos())
         self._anim.setEndValue(QPoint(self.x(), self.parentWidget().height()))
@@ -211,8 +232,7 @@ class Toast(QLabel):
 
 
 class ToastManager(QObject):
-    """Shows toasts anchored to the bottom of `host` (the central area, so the
-    status bar is never covered) and passes mouse events through to the UI below."""
+    """Shows toasts anchored to the bottom of `host` and passes mouse events through."""
 
     MAX = 3
     SPACING = 8
@@ -225,12 +245,25 @@ class ToastManager(QObject):
         self._toasts: list[Toast] = []
         host.installEventFilter(self)
 
+    @staticmethod
+    def _tone(color: str | None) -> str:
+        if not color:
+            return "accent"
+        if color in ("accent", "success", "danger", "neutral", "warning"):
+            return color
+        low = color.lower()
+        if low in ("#22c55e", "#34c759", "#16a34a"):
+            return "success"
+        if low in ("#ef4444", "#ff453a", "#dc2626"):
+            return "danger"
+        if low in ("#f59e0b", "#ff9f0a"):
+            return "warning"
+        return "neutral"
+
     def show(self, message: str, color: str | None = None) -> None:
-        bg = color or self._theme.colors["accent"]
-        fg = theme_mod.on_color(bg)
         while len(self._toasts) >= self.MAX:
             self._toasts.pop(0).dismiss(self._settings.reduced_motion)
-        toast = Toast(self._host, message, bg, fg)
+        toast = Toast(self._host, message, self._tone(color))
         self._toasts.append(toast)
         self._restack(new=toast)
         QTimer.singleShot(2800, lambda t=toast: self._remove(t))
@@ -256,10 +289,7 @@ class ToastManager(QObject):
 
 # ---------------------------------------------------------------- transitions
 class Curtain(QWidget):
-    """A flat colour veil that fades out over a page after it is swapped in.
-
-    Fading a flat rectangle is cheap and never touches the live widgets, unlike
-    QGraphicsOpacityEffect on a whole page (which blurs text and flickers)."""
+    """Flat colour veil that fades out over a page after it is swapped in."""
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -267,7 +297,7 @@ class Curtain(QWidget):
         self._alpha = 0.0
         self._color = QColor("#000000")
         self._anim = QVariantAnimation(self)
-        self._anim.setDuration(200)
+        self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.valueChanged.connect(self._on_value)
         self._anim.finished.connect(self.hide)
@@ -275,14 +305,16 @@ class Curtain(QWidget):
 
     def play(self, color: str, reduced: bool) -> None:
         if reduced:
+            self._anim.stop()
+            self.hide()
             return
         self._color = QColor(color)
         self.setGeometry(self.parentWidget().rect())
-        self._alpha = 0.92
+        self._alpha = 0.38
         self.raise_()
         self.show()
         self._anim.stop()
-        self._anim.setStartValue(0.92)
+        self._anim.setStartValue(0.38)
         self._anim.setEndValue(0.0)
         self._anim.start()
 

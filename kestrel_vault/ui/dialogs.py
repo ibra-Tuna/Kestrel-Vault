@@ -186,9 +186,10 @@ class EntryDialog(QDialog):
 
 
 class ChangeMasterDialog(QDialog):
-    def __init__(self, parent: QWidget) -> None:
+    def __init__(self, parent: QWidget, require_current: bool = True) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Change master password")
+        self._require_current = require_current
+        self.setWindowTitle("Set new master password" if not require_current else "Change master password")
         self.setModal(True)
         self.setMinimumWidth(440)
         col = QVBoxLayout(self)
@@ -197,7 +198,8 @@ class ChangeMasterDialog(QDialog):
         self.current = PasswordField()
         self.new = PasswordField()
         self.confirm = PasswordField()
-        col.addWidget(labeled("Current master password", self.current))
+        if require_current:
+            col.addWidget(labeled("Current master password", self.current))
         col.addWidget(labeled("New master password", self.new))
         self.meter = StrengthMeter()
         col.addWidget(self.meter)
@@ -223,7 +225,7 @@ class ChangeMasterDialog(QDialog):
         problem = check_master_password(new) if new else "Choose a new password."
         if not problem and new != self.confirm.text():
             problem = "The new passwords don't match."
-        if not problem and not self.current.text():
+        if not problem and self._require_current and not self.current.text():
             problem = "Enter your current password."
         self.msg.setText(problem or "")
         self.save.setEnabled(problem is None)
@@ -285,4 +287,86 @@ class HistoryDialog(QDialog):
 
     def done(self, result: int) -> None:
         self.field.reset()
+        super().done(result)
+
+
+class RecoveryKitDialog(QDialog):
+    """Displays the one-time offline recovery key so the user can copy or save it."""
+
+    def __init__(self, parent: QWidget, recovery_key: str, allow_skip: bool = False) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Save your Recovery Kit")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        self._key = recovery_key
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(24, 24, 24, 20)
+        col.setSpacing(12)
+        col.addWidget(label("Your offline Recovery Key", "h1"))
+        col.addWidget(label(
+            "If you forget your master password, this key is the ONLY way to recover your vault. "
+            "Write it down or save it somewhere offline (not inside the vault itself).",
+            "muted", wrap=True,
+        ))
+
+        self.code_field = QLineEdit(recovery_key)
+        self.code_field.setReadOnly(True)
+        self.code_field.setProperty("mono", "true")
+        self.code_field.setMinimumHeight(44)
+        col.addWidget(self.code_field)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.copy_btn = IconButton("copy", "Copy key")
+        self.save_btn = IconButton("download", "Save to file…")
+        self.copy_btn.clicked.connect(self._copy)
+        self.save_btn.clicked.connect(self._save_file)
+        actions.addWidget(self.copy_btn)
+        actions.addWidget(self.save_btn)
+        actions.addStretch(1)
+        col.addLayout(actions)
+
+        self.ack = QCheckBox("I have stored this recovery key safely offline.")
+        col.addWidget(self.ack)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        if allow_skip:
+            skip = IconButton("x", "Cancel")
+            skip.clicked.connect(self.reject)
+            row.addWidget(skip)
+        self.done_btn = IconButton("check", "Continue", "primary")
+        self.done_btn.setEnabled(False)
+        self.done_btn.clicked.connect(self.accept)
+        self.ack.toggled.connect(self.done_btn.setEnabled)
+        row.addWidget(self.done_btn)
+        col.addLayout(row)
+
+    def _copy(self) -> None:
+        QApplication.clipboard().setText(self._key)
+        self.copy_btn.setText("Copied ✓")
+
+    def _save_file(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Recovery Kit", "kestrel-vault-recovery-key.txt", "Text files (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "KESTREL VAULT RECOVERY KEY\n"
+                    "Keep this offline in a secure place.\n\n"
+                    f"Recovery Key: {self._key}\n"
+                )
+            self.save_btn.setText("Saved ✓")
+            self.ack.setChecked(True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not save", f"Failed to write file: {exc.strerror or 'error'}")
+
+    def done(self, result: int) -> None:
+        self.code_field.clear()
+        self._key = ""
         super().done(result)

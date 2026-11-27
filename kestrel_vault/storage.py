@@ -1,4 +1,4 @@
-"""On-disk storage: atomic writes, backups, lockout and settings. No Qt imports."""
+"""On-disk storage: atomic writes, backups, portable mode, lockout and settings. No Qt imports."""
 from __future__ import annotations
 
 import base64
@@ -8,24 +8,59 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import APP_SLUG, LEGACY_SLUGS
-from .crypto import (CorruptVaultError, VaultError, WrongPasswordError, decrypt_dict,
-                     encrypt_dict, normalize_kdf)
+from .crypto import (KDF_PARAMS, CorruptVaultError, VaultError, WrongPasswordError, decrypt_dict,
+                     decrypt_gcm, encrypt_gcm, fernet_key_from_raw, generate_dek, normalize_kdf,
+                     unwrap_dek_with_recovery, unwrap_key, wrap_key)
 from .models import Entry, entries_from_blob, entries_to_blob
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+CIPHER_V4 = "aes-256-gcm"
 log = logging.getLogger(__name__)
+
+_DATA_DIR_OVERRIDE: Path | None = None
+
+
+def set_data_dir(path: Path | str | None) -> None:
+    """Override the storage directory for the current process (CLI/portable mode)."""
+    global _DATA_DIR_OVERRIDE
+    _DATA_DIR_OVERRIDE = Path(path).expanduser().resolve() if path else None
+
+
+def _app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def is_portable_mode() -> bool:
+    if _DATA_DIR_OVERRIDE is not None or os.environ.get("KESTREL_VAULT_DATA_DIR"):
+        return True
+    base = _app_base_dir()
+    if (base / "portable.flag").is_file():
+        return True
+    return bool(getattr(sys, "frozen", False) and (base / "vault.json").is_file())
 
 
 def data_dir() -> Path:
+    if _DATA_DIR_OVERRIDE is not None:
+        return _DATA_DIR_OVERRIDE
+    env_dir = os.environ.get("KESTREL_VAULT_DATA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    base_app = _app_base_dir()
+    if (base_app / "portable.flag").is_file():
+        return base_app / "KestrelVaultData"
+    if getattr(sys, "frozen", False) and (base_app / "vault.json").is_file():
+        return base_app
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-    else:  # Linux and macOS: same location the original single-file version used
+    else:  # Linux and macOS
         base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     return base / APP_SLUG
 
@@ -35,11 +70,26 @@ def atomic_write(path: Path, text: str) -> None:
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # FIX: antivirus / indexers can briefly hold the destination on Windows.
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -59,19 +109,48 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
 class VaultHeader:
     salt: bytes
     kdf: dict[str, Any]
-    data: dict[str, Any]
+    data: dict[str, Any] = field(default_factory=dict)
+    schema: int = SCHEMA_VERSION
+    cipher: str = CIPHER_V4
 
     @property
     def salt_b64(self) -> str:
         return base64.b64encode(self.salt).decode("ascii")
 
+    @property
+    def has_recovery(self) -> bool:
+        return bool(self.data.get("recovery_salt") and self.data.get("recovery_wrapped_dek"))
 
-def serialize(key: bytes, salt_b64: str, kdf: dict[str, Any], entries: Any) -> dict[str, Any]:
-    return {
-        "schema": SCHEMA_VERSION, "salt": salt_b64, "kdf": kdf,
-        "canary": encrypt_dict(key, {"status": "verified", "ts": datetime.now().isoformat(timespec="seconds")}),
-        "vault_blob": encrypt_dict(key, entries_to_blob(entries)),
+
+def serialize(kek: bytes, dek: bytes, salt_b64: str, kdf: dict[str, Any], entries: Any,
+              recovery_salt_b64: str | None = None,
+              recovery_wrapped_dek: str | None = None) -> dict[str, Any]:
+    """Serialize the vault in v4 AES-256-GCM envelope format."""
+    out: dict[str, Any] = {
+        "schema": SCHEMA_VERSION,
+        "cipher": CIPHER_V4,
+        "salt": salt_b64,
+        "kdf": dict(kdf),
+        "wrapped_dek": wrap_key(kek, dek),
+        "vault_blob": encrypt_gcm(dek, entries_to_blob(entries)),
     }
+    if recovery_salt_b64 and recovery_wrapped_dek:
+        out["recovery_salt"] = recovery_salt_b64
+        out["recovery_wrapped_dek"] = recovery_wrapped_dek
+    return out
+
+
+def rewrap_vault(existing: dict[str, Any], new_kek: bytes, new_salt_b64: str,
+                 new_kdf: dict[str, Any], dek: bytes) -> dict[str, Any]:
+    """Update KEK/salt/KDF and re-wrap the existing DEK without re-encrypting vault_blob."""
+    out = dict(existing)
+    out["schema"] = SCHEMA_VERSION
+    out["cipher"] = CIPHER_V4
+    out["salt"] = new_salt_b64
+    out["kdf"] = dict(new_kdf)
+    out["wrapped_dek"] = wrap_key(new_kek, dek)
+    out.pop("canary", None)
+    return out
 
 
 def validate_backup(data: Any) -> dict[str, Any]:
@@ -90,8 +169,10 @@ def validate_backup(data: Any) -> dict[str, Any]:
         schema = int(data.get("schema", 1))
     except (TypeError, ValueError) as exc:
         raise ValueError("The backup has an invalid schema version.") from exc
-    if schema > SCHEMA_VERSION:
+    if schema < 1 or schema > SCHEMA_VERSION:
         raise ValueError("The backup was made by a newer version of Kestrel Vault.")
+    if schema >= 4 and (not isinstance(data.get("wrapped_dek"), str) or not data["wrapped_dek"]):
+        raise ValueError("The backup is missing its key envelope.")
     return data
 
 
@@ -142,7 +223,7 @@ class VaultFile:
         try:
             return not self.read().get("vault_blob")
         except VaultError:
-            return False  # a damaged file is not a new vault; don't offer to overwrite it
+            return False
 
     def load_header(self) -> VaultHeader:
         data = self.read()
@@ -156,29 +237,61 @@ class VaultFile:
             schema = int(data.get("schema", 1))
         except (TypeError, ValueError) as exc:
             raise CorruptVaultError("The vault file has an invalid schema version.") from exc
-        if schema > SCHEMA_VERSION:
+        if schema < 1 or schema > SCHEMA_VERSION:
             raise CorruptVaultError("This vault was created by a newer version of Kestrel Vault.")
-        return VaultHeader(salt, normalize_kdf(data.get("kdf")), data)
+        cipher = str(data.get("cipher") or ("fernet" if schema < 4 else CIPHER_V4))
+        return VaultHeader(salt, normalize_kdf(data.get("kdf")), data, schema=schema, cipher=cipher)
 
     def new_header(self) -> VaultHeader:
-        from .crypto import KDF_PARAMS
-        return VaultHeader(os.urandom(16), dict(KDF_PARAMS), {})
+        return VaultHeader(os.urandom(16), dict(KDF_PARAMS), {}, schema=SCHEMA_VERSION, cipher=CIPHER_V4)
 
     @staticmethod
-    def open_with_key(header: VaultHeader, key: bytes) -> tuple[list[Entry], bool]:
-        """Decrypt with `key`. Returns (entries, needs_migration). Never writes."""
+    def open_with_key(header: VaultHeader, raw_key: bytes) -> tuple[list[Entry], bytes, bool]:
+        """Decrypt with raw 32-byte `raw_key`. Returns (entries, dek, needs_migration). Never writes."""
         data = header.data
-        canary = data.get("canary")
-        if canary:
-            res = decrypt_dict(key, canary)
-            if not isinstance(res, dict) or res.get("status") != "verified":
-                raise WrongPasswordError("Incorrect master password.")
+        if header.schema < 4:
+            fkey = fernet_key_from_raw(raw_key)
+            canary = data.get("canary")
+            if canary:
+                res = decrypt_dict(fkey, canary)
+                if not isinstance(res, dict) or res.get("status") != "verified":
+                    raise WrongPasswordError("Incorrect master password.")
+            blob = data.get("vault_blob")
+            obj = decrypt_dict(fkey, blob) if blob else {}
+            if not isinstance(obj, dict):
+                raise CorruptVaultError("The vault data has an unexpected structure.")
+            return entries_from_blob(obj), generate_dek(), True
+
+        wrapped = data.get("wrapped_dek")
+        if not isinstance(wrapped, str) or not wrapped:
+            raise CorruptVaultError("The vault file is missing its encrypted key.")
+        dek = unwrap_key(raw_key, wrapped)
         blob = data.get("vault_blob")
-        obj = decrypt_dict(key, blob) if blob else {}
+        obj = decrypt_gcm(dek, blob) if blob else {}
         if not isinstance(obj, dict):
             raise CorruptVaultError("The vault data has an unexpected structure.")
-        migrated = int(data.get("schema", 1)) < SCHEMA_VERSION
-        return entries_from_blob(obj), migrated
+        needs_kdf_upgrade = header.kdf != KDF_PARAMS
+        migrated = header.schema < SCHEMA_VERSION or needs_kdf_upgrade
+        return entries_from_blob(obj), dek, migrated
+
+    @staticmethod
+    def open_with_recovery(header: VaultHeader, recovery_code: str) -> tuple[list[Entry], bytes]:
+        """Unlock a v4 vault using its offline recovery key."""
+        data = header.data
+        rsalt_b64 = data.get("recovery_salt")
+        rwrapped = data.get("recovery_wrapped_dek")
+        if not isinstance(rsalt_b64, str) or not isinstance(rwrapped, str):
+            raise CorruptVaultError("This vault does not have a recovery key configured.")
+        try:
+            rsalt = base64.b64decode(rsalt_b64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise CorruptVaultError("The recovery salt is malformed.") from exc
+        dek = unwrap_dek_with_recovery(recovery_code, rwrapped, rsalt)
+        blob = data.get("vault_blob")
+        obj = decrypt_gcm(dek, blob) if blob else {}
+        if not isinstance(obj, dict):
+            raise CorruptVaultError("The vault data has an unexpected structure.")
+        return entries_from_blob(obj), dek
 
     # ---- writing
     def write(self, data: dict[str, Any], keep_backup: bool = True) -> None:
@@ -201,10 +314,12 @@ class VaultFile:
         return dest
 
     def export_to(self, dest: str | Path) -> None:
-        shutil.copy2(self.path, dest)
+        dest_p = Path(dest)
+        dest_p.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(dest_p, self.path.read_text(encoding="utf-8"))
 
     def wipe(self) -> None:
-        """Remove the vault and every backup this app created. User-chosen exports remain."""
+        """Remove the vault and every backup this app created. User exports remain."""
         targets = [self.path, self.bak, self.legacy_bak, self.lockout_path]
         targets += list(self.dir.glob("vault.pre-import-*.json"))
         for p in targets:
@@ -256,24 +371,46 @@ class LockoutStore:
 
 # ---------------------------------------------------------------- settings
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "theme_name": "Dark", "accent": "#6366f1",
-    "auto_lock_minutes": 10, "lock_on_minimize": True, "lock_on_blur_seconds": 0,
+    "theme_name": "Dark", "accent": "#4F8EF7",
+    "auto_lock_minutes": 10, "lock_on_blur_seconds": 0,
     "clipboard_clear_seconds": 30, "reduced_motion": False,
     "sort_mode": "Name A→Z", "sidebar_visible": True,
     "window_geometry": "", "splitter_outer": "", "splitter_inner": "",
     "gen_mode": "Random", "gen_length": 20, "gen_upper": True, "gen_lower": True,
     "gen_digits": True, "gen_symbols": True, "gen_ambiguous": False,
     "gen_words": 5, "gen_sep": "-", "gen_capitalize": True, "gen_number": False,
+    "last_backup_at": "", "backup_reminder_dismissed_at": "",
 }
 
 
 def load_settings(path: Path, themes: list[str] | None = None) -> dict[str, Any]:
     s = load_json(path, DEFAULT_SETTINGS)
-    for k, v in DEFAULT_SETTINGS.items():
-        s.setdefault(k, v)
-    # v2.2 stored "never" as None, which then failed to round-trip.
+    # Legacy "null" meant "never clear the clipboard"; handle it before the
+    # type coercion below turns it into the default of 30 seconds.
     if s.get("clipboard_clear_seconds") is None:
         s["clipboard_clear_seconds"] = 0
+    # FIX: coerce values to the type of their default so a hand-edited or
+    # older-schema settings.json cannot break the UI (e.g. "10" vs 10 in a
+    # QComboBox would silently select row 0 instead of "10 minutes").
+    for k, default in DEFAULT_SETTINGS.items():
+        if k not in s:
+            s[k] = default
+            continue
+        v = s[k]
+        if type(v) is type(default):
+            continue
+        try:
+            if isinstance(default, bool):
+                if isinstance(v, str):
+                    s[k] = v.strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    s[k] = bool(v)
+            elif isinstance(default, int):
+                s[k] = int(v)
+            elif isinstance(default, str):
+                s[k] = str(v)
+        except (TypeError, ValueError):
+            s[k] = default
     if "generator_length" in s:  # old key
         s["gen_length"] = int(s.pop("generator_length") or s["gen_length"])
     if themes and s.get("theme_name") not in themes:
