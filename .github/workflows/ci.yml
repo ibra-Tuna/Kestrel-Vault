@@ -85,5 +85,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: KestrelVault-windows
-          path: KestrelVault-windows.zip
+          path: |
+            KestrelVault-windows.zip
+            dist\KestrelVault.exe
           retention-days: 14
