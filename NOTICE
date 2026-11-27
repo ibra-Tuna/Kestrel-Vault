@@ -25,5 +25,8 @@ Kestrel Vault is a substantial rewrite of BNDGG-Vault. Changes include:
   * Configurable auto-lock (idle, on minimize, on blur)
   * Sensitive clipboard handling with auto-clear and manager hints
   * Instant Caps Lock warning while typing a master password
+  * A merged title bar with native Windows resize/snap and window controls
+  * Keyboard-only focus rings and a centered, adaptive app name
+  * Redacted logging, best-effort memory wiping, and a backup/verify CLI
 
 See README.md for usage and CHANGES.md for the full change history.
