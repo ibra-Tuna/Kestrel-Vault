@@ -51,17 +51,16 @@ See [*Why a fork?*](#why-a-fork).
 
 ### Option 1 — Prebuilt release (Windows only)
 
-The latest stable build is **v3.0.0**, available from the
-[**Releases**](https://github.com/ibra-tuna/Kestrel-Vault/releases/tag/v3.0.0)
+The latest stable build is **v3.1.0**, available from the
+[**Releases**](https://github.com/ibra-tuna/Kestrel-Vault/releases/tag/v3.1.0)
 tab.
 
 > **Only Windows binaries are published.** There is **no** prebuilt Linux or
 > macOS bundle — those platforms must run from source (Option 2) or build
 > their own (see [*Build from source*](#build-from-source)).
 
-- **Windows:** download `KestrelVault-windows.zip`, unpack it, and
-  double-click `KestrelVault.exe`. Single self-contained file — no install,
-  no Python required.
+- **Windows:** download `KestrelVault.exe` and double-click it. Single
+  self-contained file — no install, no unpacking, no Python required.
 
 ### Option 2 — From source (Windows, Linux, macOS)
 
@@ -97,6 +96,8 @@ That's it. You'll be asked to create a master password on first launch.
 - **Sensitive clipboard** — copied secrets are auto-cleared after a delay
   and flagged to clipboard managers via OS-specific hints.
 - **Auto-lock** on idle, on minimize, or on window blur, each configurable.
+  Setting "lock on minimize" to **Never** really does leave the vault unlocked
+  when the window is minimized.
 - **Persistent lockout** after failed unlock attempts (survives a restart).
 
 ### Generator
@@ -120,6 +121,9 @@ That's it. You'll be asked to create a master password on first launch.
 ### Interface
 - **12 themes × 10 accent colours**, all switchable at runtime.
 - Light, dark, and high-contrast options.
+- **Merged title bar** with the menus and window controls in one row, while
+  Windows still handles edge/corner resize, Aero Snap, and maximize/restore.
+- Focus rings appear only for **keyboard navigation**, never after a mouse click.
 - Optional **reduce motion** mode for accessibility.
 - Full keyboard navigation — [see shortcuts](#keyboard-shortcuts).
 
@@ -264,6 +268,23 @@ python -m kestrel_vault
 
 ---
 
+## Command-line utilities
+
+The same encryption core is available without opening the GUI:
+
+```bash
+python -m kestrel_vault backup  backup.json
+python -m kestrel_vault restore backup.json
+python -m kestrel_vault verify
+```
+
+Use `--data-dir DIR` to operate on a portable/sandboxed vault, or
+`--portable` to use a `KestrelVaultData` folder beside the executable.
+You will be prompted for the master password when it is needed; it is never
+accepted as a command-line argument.
+
+---
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |
@@ -293,7 +314,9 @@ can be unit-tested headlessly and reused from a CLI:
 ```
 kestrel_vault/
 ├── __main__.py       entry point: `python -m kestrel_vault`
+├── cli.py            backup / restore / verify commands        (no Qt)
 ├── crypto.py         Argon2id KDF, Fernet, TOTP               (no Qt)
+├── security.py       log redaction, best-effort memory wiping  (no Qt)
 ├── storage.py        vault file I/O, atomic writes, lockout   (no Qt)
 ├── session.py        in-memory vault, debounced saves
 ├── models.py         Entry model, legacy migration, health    (no Qt)
@@ -305,6 +328,7 @@ kestrel_vault/
 ├── style.qss.tpl     Qt stylesheet template ($tokens filled by theme.py)
 └── ui/               Qt widgets — the only place that imports PySide6
     ├── main_window.py
+    ├── title_bar.py  merged menu/brand/window-control bar
     ├── unlock.py
     ├── vault.py
     ├── generator.py
@@ -314,9 +338,9 @@ kestrel_vault/
     └── common.py
 ```
 
-**The rule:** `crypto`, `storage`, `models`, `passwords`, and `importers` must
-not import `PySide6`. The test suite depends on this — it runs the core in a
-headless environment with no Qt installed.
+**The rule:** `cli`, `crypto`, `security`, `storage`, `models`, `passwords`, and
+`importers` must not import `PySide6`. The test suite depends on this — it runs
+the core in a headless environment with no Qt installed.
 
 </details>
 
